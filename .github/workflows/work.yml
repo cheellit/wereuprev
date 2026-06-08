@@ -1,0 +1,88 @@
+name: work
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - lks.txt
+      - .github/workflows/work.yml
+
+permissions:
+  contents: write
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yt-dlp and ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          yt-dlp --version
+          ffmpeg -version | head -n 1
+
+      - name: Download and transcode
+        run: |
+          set -euo pipefail
+          mkdir -p raw out
+          TARGET_BYTES=$((1850 * 1000 * 1000))
+          AUDIO_KBPS=128
+
+          n=0
+          grep -vE '^\s*(#|$)' lks.txt | while IFS= read -r url; do
+            n=$((n + 1))
+            echo "::group::[$n] $url"
+
+            yt-dlp \
+              -f 'bestvideo+bestaudio/best' \
+              --merge-output-format mp4 \
+              -o "raw/${n}_%(title)s.%(ext)s" \
+              "$url"
+
+            src="$(ls -1 raw/${n}_* | head -n 1)"
+            echo "Downloaded: $src ($(du -h "$src" | cut -f1))"
+
+            dur="$(ffprobe -v error -show_entries format=duration \
+              -of default=noprint_wrappers=1:nokey=1 "$src")"
+            dur="${dur%.*}"
+            if ! [ "${dur:-0}" -gt 0 ] 2>/dev/null; then dur=1; fi
+
+            total_kbps=$(( (TARGET_BYTES * 8 / 1000) / dur ))
+            video_kbps=$(( total_kbps - AUDIO_KBPS ))
+            if [ "$video_kbps" -gt 6000 ]; then video_kbps=6000; fi
+            if [ "$video_kbps" -lt 200 ]; then video_kbps=200; fi
+            echo "Duration ${dur}s -> target video bitrate ${video_kbps}k"
+
+            base="$(basename "${src%.*}")"
+            dst="out/${base}.mp4"
+
+            ffmpeg -y -i "$src" -c:v libx265 -b:v "${video_kbps}k" \
+              -x265-params pass=1 -an -f mp4 /dev/null
+            ffmpeg -y -i "$src" -c:v libx265 -b:v "${video_kbps}k" \
+              -x265-params pass=2 -c:a aac -b:a "${AUDIO_KBPS}k" \
+              -movflags +faststart "$dst"
+
+            echo "Encoded: $dst ($(du -h "$dst" | cut -f1))"
+            rm -f "$src" x265_2pass.log x265_2pass.log.cutree || true
+            echo "::endgroup::"
+          done
+
+          echo "Final outputs:"
+          ls -lh out/
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="work-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes "Transcoded H.265 videos from lks.txt (each under 2 GB)." \
+            out/*
